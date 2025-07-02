@@ -3,19 +3,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sentence_transformers import SentenceTransformer
-from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_groq import ChatGroq
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-import pickle
+import requests
+import json
+from pypdf import PdfReader
+import glob
 
 # === CONFIG ===
 PDF_FOLDER = "./pdfs"
-DB_PATH = "./simple_db.pkl"
-EMBED_MODEL = "all-MiniLM-L6-v2"
-GROQ_MODEL = "llama3-70b-8192"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # === FastAPI app ===
 app = FastAPI(title="RAGPsy Mental Health Chatbot API", version="1.0.0")
@@ -28,119 +23,88 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# === Global variables ===
-embeddings_model = None
-documents = []
-embeddings = []
-llm = None
+# Global variable to store PDF content
+pdf_content = ""
 
-# === 1. Initialize LLM ===
-def initialize_llm():
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    if not groq_api_key:
-        raise ValueError("⚠️ Please set your Groq API key in environment variables.")
+def load_pdfs():
+    global pdf_content
+    content = []
     
-    return ChatGroq(
-        temperature=0,
-        groq_api_key=groq_api_key,
-        model_name=GROQ_MODEL
-    )
+    if os.path.exists(PDF_FOLDER):
+        pdf_files = glob.glob(f"{PDF_FOLDER}/*.pdf")
+        for pdf_file in pdf_files:
+            try:
+                reader = PdfReader(pdf_file)
+                for page in reader.pages:
+                    content.append(page.extract_text())
+            except Exception as e:
+                print(f"Error reading {pdf_file}: {e}")
+    
+    pdf_content = "\n\n".join(content)
+    print(f"✅ Loaded {len(content)} pages from PDFs")
 
-# === 2. Load and process documents ===
-def load_documents():
-    print("📄 Loading PDFs...")
-    loader = DirectoryLoader(PDF_FOLDER, glob="*.pdf", loader_cls=PyPDFLoader)
-    docs = loader.load()
+def chat_with_groq(message):
+    if not GROQ_API_KEY:
+        return "❌ GROQ API key not configured"
     
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    chunks = splitter.split_documents(docs)
-    
-    return chunks
-
-# === 3. Create embeddings ===
-def create_embeddings(docs):
-    print("🔍 Creating embeddings...")
-    model = SentenceTransformer(EMBED_MODEL)
-    texts = [doc.page_content for doc in docs]
-    embeddings = model.encode(texts)
-    
-    # Save to pickle file
-    with open(DB_PATH, 'wb') as f:
-        pickle.dump({'texts': texts, 'embeddings': embeddings, 'docs': docs}, f)
-    
-    return texts, embeddings, docs
-
-# === 4. Load existing embeddings ===
-def load_embeddings():
-    print("📂 Loading existing embeddings...")
-    with open(DB_PATH, 'rb') as f:
-        data = pickle.load(f)
-    return data['texts'], data['embeddings'], data['docs']
-
-# === 5. Search function ===
-def search_documents(query, top_k=3):
-    global embeddings_model, documents, embeddings
-    
-    query_embedding = embeddings_model.encode([query])
-    similarities = cosine_similarity(query_embedding, embeddings)[0]
-    top_indices = np.argsort(similarities)[-top_k:][::-1]
-    
-    context = []
-    for idx in top_indices:
-        context.append(documents[idx].page_content)
-    
-    return "\n\n".join(context)
-
-# === 6. Chat function ===
-def chat_with_bot(question):
     try:
-        context = search_documents(question)
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
         
-        prompt = f"""You are a compassionate mental health chatbot. Use the context to answer the user's question kindly.
+        # Simple context search - find relevant content
+        context = ""
+        if pdf_content:
+            # Simple keyword matching
+            keywords = message.lower().split()
+            lines = pdf_content.split('\n')
+            relevant_lines = []
+            
+            for line in lines:
+                if any(keyword in line.lower() for keyword in keywords):
+                    relevant_lines.append(line)
+            
+            context = "\n".join(relevant_lines[:5])  # Top 5 relevant lines
+        
+        prompt = f"""You are a compassionate mental health chatbot. Use the context below to answer the user's question kindly and helpfully.
 
-Context:
+Context from mental health resources:
 {context}
 
-User: {question}
+User: {message}
 Chatbot:"""
+
+        data = {
+            "model": "llama3-70b-8192",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0
+        }
         
-        response = llm.invoke(prompt)
-        return response.content
+        response = requests.post(url, headers=headers, json=data)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
+        else:
+            return f"❌ Error: {response.status_code}"
+            
     except Exception as e:
         return f"❌ Error: {str(e)}"
 
-# === 7. Initialize system ===
-def initialize_system():
-    global embeddings_model, documents, embeddings, llm
-    
-    try:
-        llm = initialize_llm()
-        embeddings_model = SentenceTransformer(EMBED_MODEL)
-        
-        if os.path.exists(DB_PATH):
-            texts, emb, docs = load_embeddings()
-            documents = docs
-            embeddings = emb
-        else:
-            docs = load_documents()
-            texts, emb, docs = create_embeddings(docs)
-            documents = docs
-            embeddings = emb
-            
-        print("✅ System initialized successfully!")
-        return True
-    except Exception as e:
-        print(f"❌ Error initializing: {e}")
-        return False
+# Load PDFs on startup
+@app.on_event("startup")
+async def startup_event():
+    load_pdfs()
 
-# === 8. API Endpoints ===
 class ChatRequest(BaseModel):
     question: str
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     try:
-        response = chat_with_bot(request.question)
+        response = chat_with_groq(request.question)
         return JSONResponse(content={"answer": response})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
@@ -149,12 +113,7 @@ async def chat_endpoint(request: ChatRequest):
 def root():
     return {"message": "Mental Health Chatbot API is running."}
 
-# === 9. Startup ===
-@app.on_event("startup")
-async def startup_event():
-    initialize_system()
-
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, workers=1)
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
