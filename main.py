@@ -5,16 +5,16 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import json
-from pypdf import PdfReader
 import glob
 
 # === CONFIG ===
 PDF_FOLDER = "./pdfs"
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = "llama3-70b-8192"
 
 # === FastAPI app ===
-app = FastAPI(title="RAGPsy Mental Health Chatbot API", version="1.0.0")
+app = FastAPI()
 
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,59 +26,62 @@ app.add_middleware(
 # Global variable to store PDF content
 pdf_content = ""
 
+# === 1. Initialize system ===
 def load_pdfs():
     global pdf_content
     content = []
     
     if os.path.exists(PDF_FOLDER):
-        pdf_files = glob.glob(f"{PDF_FOLDER}/*.pdf")
-        for pdf_file in pdf_files:
+        # Simple text file reading instead of PDF parsing
+        txt_files = glob.glob(f"{PDF_FOLDER}/*.txt")
+        for txt_file in txt_files:
             try:
-                reader = PdfReader(pdf_file)
-                for page in reader.pages:
-                    content.append(page.extract_text())
+                with open(txt_file, 'r', encoding='utf-8') as file:
+                    content.append(file.read())
             except Exception as e:
-                print(f"Error reading {pdf_file}: {e}")
+                print(f"Error reading {txt_file}: {e}")
     
     pdf_content = "\n\n".join(content)
-    print(f"✅ Loaded {len(content)} pages from PDFs")
+    print(f"✅ Loaded content from {len(content)} files")
 
-def chat_with_groq(message):
-    if not GROQ_API_KEY:
+# === 2. Chat with Groq ===
+def chat_with_groq(question):
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
         return "❌ GROQ API key not configured"
     
     try:
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Authorization": f"Bearer {groq_api_key}",
             "Content-Type": "application/json"
         }
         
-        # Simple context search - find relevant content
+        # Simple context search
         context = ""
         if pdf_content:
-            # Simple keyword matching
-            keywords = message.lower().split()
+            keywords = question.lower().split()
             lines = pdf_content.split('\n')
             relevant_lines = []
             
             for line in lines:
-                if any(keyword in line.lower() for keyword in keywords):
+                if any(keyword in line.lower() for keyword in keywords if len(keyword) > 2):
                     relevant_lines.append(line)
             
-            context = "\n".join(relevant_lines[:5])  # Top 5 relevant lines
+            context = "\n".join(relevant_lines[:10])  # Top 10 relevant lines
         
-        prompt = f"""You are a compassionate mental health chatbot. Use the context below to answer the user's question kindly and helpfully.
+        prompt_template = f"""
+        You are a compassionate mental health chatbot. Use the context to answer the user's question kindly.
 
-Context from mental health resources:
-{context}
+        Context:
+        {context}
 
-User: {message}
-Chatbot:"""
+        User: {question}
+        Chatbot:"""
 
         data = {
-            "model": "llama3-70b-8192",
-            "messages": [{"role": "user", "content": prompt}],
+            "model": GROQ_MODEL,
+            "messages": [{"role": "user", "content": prompt_template}],
             "temperature": 0
         }
         
@@ -93,11 +96,10 @@ Chatbot:"""
     except Exception as e:
         return f"❌ Error: {str(e)}"
 
-# Load PDFs on startup
-@app.on_event("startup")
-async def startup_event():
-    load_pdfs()
+# Load content on startup
+load_pdfs()
 
+# === 3. FastAPI Endpoint ===
 class ChatRequest(BaseModel):
     question: str
 
@@ -113,6 +115,7 @@ async def chat_endpoint(request: ChatRequest):
 def root():
     return {"message": "Mental Health Chatbot API is running."}
 
+# === 4. Run the app ===
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
